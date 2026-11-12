@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -50,6 +51,85 @@ class FakeContext:
 def ids(files, **kw):
     changes = ci.Changes("HEAD", "HEAD", files)
     return {c.id for c in ci.static_checks(changes, FakeContext(**kw))}
+
+
+class ChangedFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.run_git("init", "-q", str(self.repo), cwd=self.root)
+        self.run_git("config", "user.name", "Test", cwd=self.repo)
+        self.run_git("config", "user.email", "test@example.invalid", cwd=self.repo)
+        (self.repo / "changed.txt").write_text("before\n")
+        (self.repo / "stable.txt").write_text("stable\n")
+        self.run_git("add", ".", cwd=self.repo)
+        self.run_git("commit", "-qm", "base", cwd=self.repo)
+        self.base = self.run_git("rev-parse", "HEAD", cwd=self.repo).strip()
+        (self.repo / "changed.txt").write_text("after\n")
+        self.run_git("commit", "-qam", "change", cwd=self.repo)
+        self.old_root = ci.ROOT
+        ci.ROOT = self.repo
+
+    def tearDown(self):
+        ci.ROOT = self.old_root
+        self.tmp.cleanup()
+
+    @staticmethod
+    def run_git(*args, cwd):
+        result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        return result.stdout
+
+    def shallow(self):
+        shallow = self.root / "shallow"
+        self.run_git("clone", "-q", "--depth=1", self.repo.as_uri(), str(shallow), cwd=self.root)
+        self.run_git("fetch", "-q", "--depth=1", "origin", self.base, cwd=shallow)
+        ci.ROOT = shallow
+        # Both commits exist, but Git cannot see their common history.
+        self.assertEqual(self.run_git("diff", "--name-only", self.base, "HEAD", cwd=shallow).strip(), "changed.txt")
+        return shallow
+
+    def test_shallow_history_never_turns_a_diff_error_into_no_changes(self):
+        self.shallow()
+        with self.assertRaisesRegex(RuntimeError, "no merge base"):
+            ci.changed_files(self.base)
+
+    def test_cli_exits_two_with_git_error_instead_of_false_green(self):
+        shallow = self.shallow()
+        result = subprocess.run(
+            [sys.executable, str(Path(ci.__file__).resolve()), "--list", "--no-install", "--base", self.base],
+            cwd=shallow, text=True, capture_output=True,
+            env={**os.environ, "CUA_CI_ROOT": str(shallow)},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot determine changed files", result.stderr)
+        self.assertIn("no merge base", result.stderr)
+        self.assertNotIn("nothing changed", result.stdout)
+
+    def test_full_history_preserves_committed_unstaged_and_untracked_changes(self):
+        (self.repo / "new.txt").write_text("new\n")
+        (self.repo / "stable.txt").write_text("unstaged\n")
+        self.assertEqual(ci.changed_files(self.base), ["changed.txt", "new.txt", "stable.txt"])
+
+    def test_staged_deletions_remain_in_the_change_set(self):
+        head = self.run_git("rev-parse", "HEAD", cwd=self.repo).strip()
+        self.run_git("rm", "-q", "changed.txt", cwd=self.repo)
+        self.assertEqual(ci.changed_files(head), ["changed.txt"])
+
+    def test_a_clean_checkout_still_reports_no_changes(self):
+        head = self.run_git("rev-parse", "HEAD", cwd=self.repo).strip()
+        self.assertEqual(ci.changed_files(head), [])
+
+    def test_every_discovery_command_is_checked(self):
+        for failing in range(3):
+            replies = [""] * failing + [RuntimeError("command failed")]
+            with self.subTest(command=failing), patch.object(ci, "sh", side_effect=replies) as command:
+                with self.assertRaisesRegex(RuntimeError, "command failed"):
+                    ci.changed_files(self.base)
+                for call in command.call_args_list:
+                    self.assertTrue(call.kwargs.get("check", False))
 
 
 class Routing(unittest.TestCase):

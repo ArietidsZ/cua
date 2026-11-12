@@ -522,7 +522,7 @@ def find_base(explicit: Optional[str]) -> Tuple[str, str]:
 def changed_files(base: str) -> List[str]:
     out = set()
     for args in (("diff", "--name-only", f"{base}...HEAD"), ("diff", "--name-only", "HEAD"), ("ls-files", "--others", "--exclude-standard")):
-        out.update(line for line in git(*args).splitlines() if line)
+        out.update(line for line in sh(["git", *args], check=True).splitlines() if line)
     return sorted(out)
 
 
@@ -1574,7 +1574,12 @@ def main(argv: Sequence[str]) -> int:
                 return signoff(state)
 
     base, base_desc = find_base(args.base)
-    changes = Changes(base, base_desc, changed_files(base), full=args.full)
+    try:
+        files = changed_files(base)
+    except RuntimeError as error:
+        print(f"bin/ci: cannot determine changed files: {error}", file=sys.stderr)
+        return 2
+    changes = Changes(base, base_desc, files, full=args.full)
     if not changes.files and not args.full:
         print(f"bin/ci: nothing changed against {base[:10]} ({base_desc})")
         return 0
